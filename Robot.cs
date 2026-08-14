@@ -29,8 +29,26 @@ namespace RobotVacuum
         }
         public void EvOn()
         {
-            // TODO: לוגיקת הפעלה (יציאה אחורה, סיבוב והתחלת ניקוי)
-            Console.WriteLine("Event received: evOn");
+            Console.WriteLine("Event received: evOn - starting cleaning");
+            _currentState = RobotState.Cleaning;
+
+            if (_isWashingMode)
+            {
+                _cleaner.StartWashing();
+            }
+            else
+            {
+                _cleaner.StartCleaning();
+            }
+            _movement.GoBackward();
+            _movement.Turn(180);
+            _movement.GoForward();
+    
+            Console.WriteLine("Robot is now out of the dock and Cleaning.");
+
+            else{// במקרה שהלחצן נלחץ כשהשואב כבר מנקה או תקוע - נתעלם
+                Console.WriteLine($"Event evOn ignored. Current state is: {_currentState}");
+                }
         }
 
         public void EvHome()
