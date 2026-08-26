@@ -2,9 +2,9 @@ namespace RobotVacuum.Interfaces
 {
     public interface ICleaner
     {
-        void startVacuum();
-        void startWashing();
-        void stop();
+        void StartVacuum();
+        void StartWashing();
+        void Stop();
 
     }
 }
