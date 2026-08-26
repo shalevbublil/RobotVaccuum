@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Generic; // Fix: Import for lists
-using RobotVacuum.Interfaces;      // Ensure this matches your interface namespace
+using System.Collections.Generic;
+using RobotVacuum.Interfaces;
 
 namespace RobotVacuum
 {
@@ -12,31 +12,44 @@ namespace RobotVacuum
 
         // --- Grid Map and Navigation Components ---
         private readonly GridMap _map;
-        private int _currentR = 0; // Current grid row index
-        private int _currentC = 0; // Current grid column index
-        private List<Tuple<int, int>>? _plannedPathToHome; // Path calculated by BFS
-        private int _currentPathIndex = 0; // Index of current step in path
+        private int _currentR = 0; 
+        private int _currentC = 0; 
+        private List<Tuple<int, int>>? _plannedPathToHome; 
+        private int _currentPathIndex = 0; 
+
+        // --- Smart Roborock-style Cleaning State Variables ---
+        private enum CleaningPhase
+        {
+            Perimeter,      // Phase 1: Clean perimeter of walls and obstacles
+            InteriorZigzag, // Phase 2: Clean remaining interior cells with zigzag sweeps
+            Done            // Completed cleaning
+        }
+
+        private CleaningPhase _currentCleaningPhase = CleaningPhase.Perimeter;
+        private int _dirC = 1; // 1 for moving right, -1 for moving left
+        private List<Tuple<int, int>>? _recoveryPathToUncleaned;
+        private int _recoveryPathIndex = 0;
 
         public enum RobotState 
         { 
-            AtHome,         // Robot is docked in charging station
-            Cleaning,       // Robot is actively cleaning
-            ReturningHome,  // Robot is navigating back to charging station
-            Stuck           // Robot is stuck and requires hardware service
+            AtHome,         
+            Cleaning,       
+            ReturningHome,  
+            Stuck           
         }
+        public RobotState CurrentState => _currentState;
 
         private RobotState _currentState;
         private RobotState _previousState; 
         private bool _isWashingMode;       
 
         // --- Custom User Settings ---
-        private readonly int _lowBatteryThreshold; // Battery percentage to trigger return home
-        private readonly int _obstacleTurnAngle;   // Angle to turn during obstacle avoidance
+        private readonly int _lowBatteryThreshold; 
+        private readonly int _obstacleTurnAngle;   
 
         // --- Internal Timers ---
         private int _secondsSinceLastBatteryCheck = 0;
 
-        // Constructor with Dependency Injection for hardware interfaces and GridMap
         public Robot(ICleaner cleaner, IMovement movement, IBattery battery, GridMap map, 
                      int lowBatteryThreshold = 5, int obstacleTurnAngle = 45)
         {
@@ -51,7 +64,6 @@ namespace RobotVacuum
             _currentState = RobotState.AtHome; 
             _isWashingMode = false;       
 
-            // Robot starts docked at (0,0)
             _currentR = 0; 
             _currentC = 0;     
         }
@@ -59,7 +71,6 @@ namespace RobotVacuum
         // --- Main Simulation Time Progression Tick ---
         public void Tick(int seconds)
         {
-            // If stuck, time passes but no internal physical progress is made
             if (_currentState == RobotState.Stuck)
             {
                 Console.WriteLine($"[Simulation] {seconds}s passed, but Robot is STUCK. No actions taken.");
@@ -68,18 +79,27 @@ namespace RobotVacuum
 
             for (int i = 0; i < seconds; i++)
             {
-                // 1. Perform battery check every 100 seconds
+                // Perform battery check every 5 seconds for responsiveness
                 _secondsSinceLastBatteryCheck++;
-                if (_secondsSinceLastBatteryCheck >= 100)
+                if (_secondsSinceLastBatteryCheck >= 5)
                 {
                     _secondsSinceLastBatteryCheck = 0;
                     PerformBatteryCheck();
                 }
 
-                // 2. Move step-by-step along the map every 1 second when returning home
+                // If battery check forced returning home, stop cleaning immediately
                 if (_currentState == RobotState.ReturningHome)
                 {
-                    MoveOneStepOnBFSPath(); 
+                    MoveOneStepOnBFSPath();
+                    continue;
+                }
+
+                if (_currentState == RobotState.Cleaning)
+                {
+                    MoveOneStepCleaning();
+                    
+                    // Simulate battery drain: 1% per second of cleaning
+                    (_battery as ConsoleBattery)?.Drain(1);
                 }
             }
         }
@@ -91,11 +111,10 @@ namespace RobotVacuum
         private void PerformBatteryCheck()
         {
             int currentBattery = _battery.GetChargePercent();
-            Console.WriteLine($"[Robot] [100s Timer] Checking Battery: {currentBattery}%");
+            Console.WriteLine($"[Robot] [5s Timer] Checking Battery: {currentBattery}%");
 
             if (_currentState != RobotState.AtHome)
             {
-                // If battery drops below threshold, initiate automatic return home sequence
                 if (currentBattery < _lowBatteryThreshold)
                 {
                     Console.WriteLine($"[Robot] Battery low (< {_lowBatteryThreshold}%). Starting automatic return home.");
@@ -104,28 +123,25 @@ namespace RobotVacuum
             }
             else 
             {
-                // Charging station logic while AtHome
                 if (currentBattery == 100)
                 {
-                    _battery.StopCharge(); // Avoid overcharging
+                    _battery.StopCharge(); 
                 }
                 else if (currentBattery < 80)
                 {
-                    _battery.Charge(); // Restart charging if battery drops below 80%
+                    _battery.Charge(); 
                 }
             }
         }
 
-        // Calculates the shortest path using BFS immediately upon starting return
         private void StartReturningHomeSequence()
         {
             _currentState = RobotState.ReturningHome;
             _cleaner.Stop(); 
             _movement.Stop();
+            _recoveryPathToUncleaned = null; // Clear active recovery path
             
             Console.WriteLine($"[Robot] Calculating shortest path from ({_currentR},{_currentC}) to Home (0,0) using BFS...");
-            
-            // Run BFS on our 2D grid map
             _plannedPathToHome = _map.FindPathToHome(_currentR, _currentC);
             _currentPathIndex = 0;
 
@@ -139,7 +155,123 @@ namespace RobotVacuum
             }
         }
 
-        // Takes one step on the BFS-calculated path
+        private void MoveOneStepCleaning()
+        {
+            // Mark the current position as cleaned
+            _map.MarkCleaned(_currentR, _currentC);
+
+            // PHASE 1: Perimeter Cleaning (Wall and Obstacle Following)
+            if (_currentCleaningPhase == CleaningPhase.Perimeter)
+            {
+                if (_recoveryPathToUncleaned != null && _recoveryPathIndex < _recoveryPathToUncleaned.Count)
+                {
+                    var nextStep = _recoveryPathToUncleaned[_recoveryPathIndex];
+                    _recoveryPathIndex++;
+                    _currentR = nextStep.Item1;
+                    _currentC = nextStep.Item2;
+                    Console.WriteLine($"[Robot] [Cleaning - Perimeter Phase] Moving to ({_currentR}, {_currentC})");
+                    _map.PrintMap(_currentR, _currentC);
+                    return;
+                }
+
+                // Find the nearest uncleaned perimeter cell using BFS
+                _recoveryPathToUncleaned = _map.FindPathToNearestUncleanedPerimeter(_currentR, _currentC);
+                _recoveryPathIndex = 0;
+
+                if (_recoveryPathToUncleaned != null && _recoveryPathToUncleaned.Count > 0)
+                {
+                    var nextStep = _recoveryPathToUncleaned[_recoveryPathIndex];
+                    _recoveryPathIndex++;
+                    _currentR = nextStep.Item1;
+                    _currentC = nextStep.Item2;
+                    Console.WriteLine($"[Robot] [Cleaning - Perimeter Phase] Moving to ({_currentR}, {_currentC})");
+                    _map.PrintMap(_currentR, _currentC);
+                }
+                else
+                {
+                    // No uncleaned perimeter cells left! Transition to Interior Zigzag Phase
+                    Console.WriteLine("[Robot] >>> Perimeter cleaning complete! Transitioning to Interior Zigzag Sweep. <<<");
+                    _currentCleaningPhase = CleaningPhase.InteriorZigzag;
+                    _recoveryPathToUncleaned = null;
+                    
+                    // Call cleaning again to immediately start the next phase
+                    MoveOneStepCleaning();
+                }
+            }
+            // PHASE 2: Interior Zigzag Sweeping & BFS Recovery
+            else if (_currentCleaningPhase == CleaningPhase.InteriorZigzag)
+            {
+                if (_recoveryPathToUncleaned != null && _recoveryPathIndex < _recoveryPathToUncleaned.Count)
+                {
+                    var nextStep = _recoveryPathToUncleaned[_recoveryPathIndex];
+                    _recoveryPathIndex++;
+                    _currentR = nextStep.Item1;
+                    _currentC = nextStep.Item2;
+                    Console.WriteLine($"[Robot] [Cleaning - BFS Interior Recovery] Moving to ({_currentR}, {_currentC})");
+                    _map.PrintMap(_currentR, _currentC);
+
+                    if (_recoveryPathIndex >= _recoveryPathToUncleaned.Count)
+                    {
+                        _recoveryPathToUncleaned = null; // Reached recovery destination
+                        Console.WriteLine("[Robot] Reached target interior area. Resuming interior zigzag sweep.");
+                    }
+                    return;
+                }
+
+                // Normal horizontal movement inside the interior bounds (skipping perimeter)
+                int nextR = _currentR;
+                int nextC = _currentC + _dirC;
+
+                if (nextC >= 0 && nextC < 10 && !_map.IsObstacle(nextR, nextC) && !_map.IsPerimeter(nextR, nextC))
+                {
+                    _currentR = nextR;
+                    _currentC = nextC;
+                    Console.WriteLine($"[Robot] [Cleaning - Interior Zigzag] Sweeping to ({_currentR}, {_currentC})");
+                    _map.PrintMap(_currentR, _currentC);
+                }
+                else
+                {
+                    // Boundary/perimeter hit. Move down to the next row
+                    nextR = _currentR + 1;
+                    _dirC = -_dirC; // Reverse sweeping direction
+                    nextC = _currentC;
+
+                    if (nextR < 10 && !_map.IsObstacle(nextR, nextC) && !_map.IsPerimeter(nextR, nextC))
+                    {
+                        _currentR = nextR;
+                        _currentC = nextC;
+                        Console.WriteLine($"[Robot] [Cleaning - Interior Zigzag] Moving down to row ({_currentR}, {_currentC})");
+                        _map.PrintMap(_currentR, _currentC);
+                    }
+                    else
+                    {
+                        // Dead end in interior! Run BFS to find the closest uncleaned interior cell (resolves the orphan-cell issue)
+                        Console.WriteLine($"[Robot] Interior zigzag hit dead end at ({_currentR}, {_currentC}). Finding nearest uncleaned interior cell...");
+                        _recoveryPathToUncleaned = _map.FindPathToNearestUncleanedInterior(_currentR, _currentC);
+                        _recoveryPathIndex = 0;
+
+                        if (_recoveryPathToUncleaned != null && _recoveryPathToUncleaned.Count > 0)
+                        {
+                            Console.WriteLine($"[Robot] Path to uncleaned interior area found ({_recoveryPathToUncleaned.Count} steps). Navigating...");
+                            var nextStep = _recoveryPathToUncleaned[_recoveryPathIndex];
+                            _recoveryPathIndex++;
+                            _currentR = nextStep.Item1;
+                            _currentC = nextStep.Item2;
+                            Console.WriteLine($"[Robot] [Cleaning - BFS Interior Recovery] Moving to ({_currentR}, {_currentC})");
+                            _map.PrintMap(_currentR, _currentC);
+                        }
+                        else
+                        {
+                            // Absolutely no uncleaned reachable interior cells left! Cleaning complete!
+                            Console.WriteLine("[Robot] >>> All reachable perimeter and interior cells are clean! Returning to dock. <<<");
+                            _currentCleaningPhase = CleaningPhase.Done;
+                            StartReturningHomeSequence();
+                        }
+                    }
+                }
+            }
+        }
+
         private void MoveOneStepOnBFSPath()
         {
             if (_plannedPathToHome == null || _currentPathIndex >= _plannedPathToHome.Count)
@@ -154,10 +286,9 @@ namespace RobotVacuum
             _currentR = nextStep.Item1;
             _currentC = nextStep.Item2;
 
-            Console.WriteLine($"[Robot] [1s Move] Robot moved to ({_currentR}, {_currentC})");
+            Console.WriteLine($"[Robot] [1s Move] Robot returning home at ({_currentR}, {_currentC})");
             _map.PrintMap(_currentR, _currentC); 
 
-            // Check if docked at Home
             if (_currentR == 0 && _currentC == 0)
             {
                 EvArrivedHome();
@@ -168,12 +299,19 @@ namespace RobotVacuum
         // Event Handlers
         // ==========================================
 
-        public void EvOn()
+        public void EvOn(int startR = 0, int startC = 0)
         {
             if (_currentState == RobotState.AtHome)
             {
-                Console.WriteLine("Event received: evOn - starting cleaning");
+                if (_map.IsObstacle(startR, startC))
+                {
+                    Console.WriteLine($"[Robot] Error: Start position ({startR},{startC}) is an obstacle! Cannot start.");
+                    return;
+                }
+
+                Console.WriteLine($"Event received: evOn - starting cleaning at position ({startR}, {startC})");
                 _currentState = RobotState.Cleaning;
+                _currentCleaningPhase = CleaningPhase.Perimeter; // Reset to perimeter phase on startup
 
                 if (_isWashingMode)
                 {
@@ -184,17 +322,12 @@ namespace RobotVacuum
                     _cleaner.StartVacuum();
                 }
                 
-                // Hardware action simulation for undocking
-                _movement.GoBackward();
-                _movement.Turn(180);
-                _movement.GoForward();
+                _currentR = startR;
+                _currentC = startC;
+                _map.MarkCleaned(_currentR, _currentC);
 
-                // Set initial coordinates in room and mark as cleaned
-                _currentR = 5; 
-                _currentC = 5; 
-                _map.MarkCleaned(_currentR, _currentC); 
-
-                Console.WriteLine($"Robot is now out of the dock and Cleaning. Position set to ({_currentR}, {_currentC})"); 
+                Console.WriteLine($"Robot is now out of the dock and Cleaning."); 
+                _map.PrintMap(_currentR, _currentC);
             }
             else
             {
@@ -283,7 +416,6 @@ namespace RobotVacuum
                 _currentState = RobotState.AtHome;
                 _movement.Stop();
                 
-                // Begin charging if battery is not full
                 int batteryPercent = _battery.GetChargePercent();
                 if (batteryPercent < 100)
                 {
