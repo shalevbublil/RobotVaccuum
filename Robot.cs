@@ -1,5 +1,6 @@
 using System;
-using RobotVacuum.Interfaces;
+using System.Collections.Generic; // Fix: Import for lists
+using RobotVacuum.Interfaces;      // Ensure this matches your interface namespace
 
 namespace RobotVacuum
 {
@@ -9,47 +10,56 @@ namespace RobotVacuum
         private readonly IMovement _movement;
         private readonly IBattery _battery;
 
+        // --- Grid Map and Navigation Components ---
+        private readonly GridMap _map;
+        private int _currentR = 0; // Current grid row index
+        private int _currentC = 0; // Current grid column index
+        private List<Tuple<int, int>>? _plannedPathToHome; // Path calculated by BFS
+        private int _currentPathIndex = 0; // Index of current step in path
+
         public enum RobotState 
         { 
-            AtHome,         // in the charging station
-            Cleaning,       // actively cleaning
-            ReturningHome,  // returning to the charging station
-            Stuck           // stuck and waiting for physical service
+            AtHome,         // Robot is docked in charging station
+            Cleaning,       // Robot is actively cleaning
+            ReturningHome,  // Robot is navigating back to charging station
+            Stuck           // Robot is stuck and requires hardware service
         }
 
         private RobotState _currentState;
         private RobotState _previousState; 
         private bool _isWashingMode;       
 
-        // --- Configuration Parameters ---
-        private readonly int _lowBatteryThreshold; // percentage below which the robot should return home (default 5%)
-        private readonly int _obstacleTurnAngle;   // degrees to turn when avoiding obstacles (default 45°)
+        // --- Custom User Settings ---
+        private readonly int _lowBatteryThreshold; // Battery percentage to trigger return home
+        private readonly int _obstacleTurnAngle;   // Angle to turn during obstacle avoidance
 
         // --- Internal Timers ---
         private int _secondsSinceLastBatteryCheck = 0;
-        private int _secondsSinceLastDockSearch = 0;
-        private int _secondsSinceLastNavigation = 0;
-        private bool _isHomeLocated = false; // whether the charging station has been located (step 1 of the return process)
 
-        // constructor with dependency injection for hardware interfaces and configuration parameters 
-        public Robot(ICleaner cleaner, IMovement movement, IBattery battery, 
+        // Constructor with Dependency Injection for hardware interfaces and GridMap
+        public Robot(ICleaner cleaner, IMovement movement, IBattery battery, GridMap map, 
                      int lowBatteryThreshold = 5, int obstacleTurnAngle = 45)
         {
             _cleaner = cleaner;
             _movement = movement;
             _battery = battery;
-            
+            _map = map; 
+
             _lowBatteryThreshold = lowBatteryThreshold;
             _obstacleTurnAngle = obstacleTurnAngle;
 
             _currentState = RobotState.AtHome; 
-            _isWashingMode = false;            
+            _isWashingMode = false;       
+
+            // Robot starts docked at (0,0)
+            _currentR = 0; 
+            _currentC = 0;     
         }
 
-        // --- Main Simulation Tick ---
+        // --- Main Simulation Time Progression Tick ---
         public void Tick(int seconds)
         {
-            // if the robot is stuck, we do not perform any actions during the tick
+            // If stuck, time passes but no internal physical progress is made
             if (_currentState == RobotState.Stuck)
             {
                 Console.WriteLine($"[Simulation] {seconds}s passed, but Robot is STUCK. No actions taken.");
@@ -58,7 +68,7 @@ namespace RobotVacuum
 
             for (int i = 0; i < seconds; i++)
             {
-                // manage battery checks every 100 seconds
+                // 1. Perform battery check every 100 seconds
                 _secondsSinceLastBatteryCheck++;
                 if (_secondsSinceLastBatteryCheck >= 100)
                 {
@@ -66,32 +76,17 @@ namespace RobotVacuum
                     PerformBatteryCheck();
                 }
 
-                // manage the return home process if the robot is in ReturningHome state
+                // 2. Move step-by-step along the map every 1 second when returning home
                 if (_currentState == RobotState.ReturningHome)
                 {
-                    if (!_isHomeLocated)
-                    {
-                       // stage 1: searching for the charging station direction - check every second
-                        _secondsSinceLastDockSearch++;
-                        if (_secondsSinceLastDockSearch >= 1)
-                        {
-                            _secondsSinceLastDockSearch = 0;
-                            TryLocateHome();
-                        }
-                    }
-                    else
-                    {
-                        // stage 2: active navigation - calculate angle and turn every 7 seconds
-                        _secondsSinceLastNavigation++;
-                        if (_secondsSinceLastNavigation >= 7)
-                        {
-                            _secondsSinceLastNavigation = 0;
-                            NavigateTowardsHome();
-                        }
-                    }
+                    MoveOneStepOnBFSPath(); 
                 }
             }
         }
+
+        // ==========================================
+        // Private Helper Functions
+        // ==========================================
 
         private void PerformBatteryCheck()
         {
@@ -100,55 +95,77 @@ namespace RobotVacuum
 
             if (_currentState != RobotState.AtHome)
             {
-                // if the robot is not at home, check if battery is below threshold to initiate return home
+                // If battery drops below threshold, initiate automatic return home sequence
                 if (currentBattery < _lowBatteryThreshold)
                 {
                     Console.WriteLine($"[Robot] Battery low (< {_lowBatteryThreshold}%). Starting automatic return home.");
                     StartReturningHomeSequence();
                 }
             }
-            else // the robot is at home
+            else 
             {
+                // Charging station logic while AtHome
                 if (currentBattery == 100)
                 {
-                    _battery.StopCharge(); // if fully charged, stop charging
+                    _battery.StopCharge(); // Avoid overcharging
                 }
                 else if (currentBattery < 80)
                 {
-                    _battery.Charge(); // recharge if battery is below 80% while at home
+                    _battery.Charge(); // Restart charging if battery drops below 80%
                 }
             }
         }
 
+        // Calculates the shortest path using BFS immediately upon starting return
         private void StartReturningHomeSequence()
         {
             _currentState = RobotState.ReturningHome;
-            _cleaner.Stop(); // stop cleaning systems
-            _isHomeLocated = false;
-            _secondsSinceLastDockSearch = 0;
-            _secondsSinceLastNavigation = 0;
-            Console.WriteLine("[Robot] Cleaning stopped. Phase 1: Moving and searching for charging station direction...");
+            _cleaner.Stop(); 
+            _movement.Stop();
+            
+            Console.WriteLine($"[Robot] Calculating shortest path from ({_currentR},{_currentC}) to Home (0,0) using BFS...");
+            
+            // Run BFS on our 2D grid map
+            _plannedPathToHome = _map.FindPathToHome(_currentR, _currentC);
+            _currentPathIndex = 0;
+
+            if (_plannedPathToHome != null)
+            {
+                Console.WriteLine($"[Robot] Path found! Shortest distance: {_plannedPathToHome.Count} steps.");
+            }
+            else
+            {
+                Console.WriteLine("[Robot] Error: No path found! Robot is blocked by obstacles.");
+            }
         }
 
-        private void TryLocateHome()
+        // Takes one step on the BFS-calculated path
+        private void MoveOneStepOnBFSPath()
         {
-            Console.WriteLine("[Robot] [1s Sensor] Scanning for charging station signal...");
-            // simulate successful detection of the charging station
-            _isHomeLocated = true; 
-            Console.WriteLine("[Robot] Charging station located! Phase 2: Switch to active 7s navigation.");
-            _secondsSinceLastNavigation = 0;
-        }
+            if (_plannedPathToHome == null || _currentPathIndex >= _plannedPathToHome.Count)
+            {
+                EvArrivedHome(); 
+                return;
+            }
 
-        private void NavigateTowardsHome()
-        {
-            int angle = GetHomeAngle();
-            Console.WriteLine($"[Robot] [7s Navigation] Recalculating route. Turning {angle}° towards dock and driving forward.");
-            _movement.Turn(angle);
-            _movement.GoForward();
+            var nextStep = _plannedPathToHome[_currentPathIndex];
+            _currentPathIndex++;
+
+            _currentR = nextStep.Item1;
+            _currentC = nextStep.Item2;
+
+            Console.WriteLine($"[Robot] [1s Move] Robot moved to ({_currentR}, {_currentC})");
+            _map.PrintMap(_currentR, _currentC); 
+
+            // Check if docked at Home
+            if (_currentR == 0 && _currentC == 0)
+            {
+                EvArrivedHome();
+            }
         }
 
         // ==========================================
-        // Event Handlers for Robot Events
+        // Event Handlers
         // ==========================================
 
         public void EvOn()
@@ -167,11 +184,17 @@ namespace RobotVacuum
                     _cleaner.StartVacuum();
                 }
                 
+                // Hardware action simulation for undocking
                 _movement.GoBackward();
                 _movement.Turn(180);
                 _movement.GoForward();
 
-                Console.WriteLine("Robot is now out of the dock and Cleaning."); 
+                // Set initial coordinates in room and mark as cleaned
+                _currentR = 5; 
+                _currentC = 5; 
+                _map.MarkCleaned(_currentR, _currentC); 
+
+                Console.WriteLine($"Robot is now out of the dock and Cleaning. Position set to ({_currentR}, {_currentC})"); 
             }
             else
             {
@@ -181,7 +204,6 @@ namespace RobotVacuum
 
         public void EvHome()
         {
-            // only allow manual return to dock if the robot is not already at home or stuck
             if (_currentState != RobotState.AtHome && _currentState != RobotState.Stuck)
             {
                 Console.WriteLine("[Robot] Event received: evHome. User requested manual return to dock.");
@@ -261,7 +283,7 @@ namespace RobotVacuum
                 _currentState = RobotState.AtHome;
                 _movement.Stop();
                 
-                // start charging if battery is not full
+                // Begin charging if battery is not full
                 int batteryPercent = _battery.GetChargePercent();
                 if (batteryPercent < 100)
                 {
@@ -273,14 +295,5 @@ namespace RobotVacuum
                 Console.WriteLine($"[Robot] Event evArrivedHome ignored. Current state is: {_currentState}");
             }
         }
-
-        // ==========================================
-        // Helper Functions for the Controller
-        // ==========================================
-        private int GetHomeAngle()
-        {
-            // In a real implementation, this would calculate the angle to the charging station based on sensor data.
-            return 35; 
-        }
-    }
+    } 
 }
